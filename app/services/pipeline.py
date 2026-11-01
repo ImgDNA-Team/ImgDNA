@@ -1,22 +1,38 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
+from app.services.ela_forensics import analyze as tampering_analyze
+
 
 class VerificationBarrier(ABC):
+    name = "barrier"
+
     @abstractmethod
-    def process(self, image_path: str) -> Dict[str, Any]:
+    def process(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
         pass
 
+
 class WatermarkBarrier(VerificationBarrier):
-    def process(self, image_path: str) -> Dict[str, Any]:
+    name = "watermark"
+
+    def process(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
         return {"barrier": "watermark", "status": "intact", "payload_matched": True}
 
+
 class DeepfakeBarrier(VerificationBarrier):
-    def process(self, image_path: str) -> Dict[str, Any]:
+    name = "deepfake"
+
+    def process(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
         return {"barrier": "deepfake", "manipulation_score": 0.05}
 
+
 class TamperingBarrier(VerificationBarrier):
-    def process(self, image_path: str) -> Dict[str, Any]:
-        return {"barrier": "tampering", "ela_score": 0.02}
+    """Pixel-level barrier (Person 3): preprocessing + ELA + comparison with the registered original."""
+    name = "tampering"
+
+    def process(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
+        return tampering_analyze(image_path, reference_path)
+
 
 class VerificationPipeline:
     def __init__(self):
@@ -24,13 +40,17 @@ class VerificationPipeline:
         self.deepfake_barrier = DeepfakeBarrier()
         self.tampering_barrier = TamperingBarrier()
 
-    def run_pipeline(self, image_path: str) -> Dict[str, Any]:
-        res_b1 = self.watermark_barrier.process(image_path)
-        res_b2a = self.deepfake_barrier.process(image_path)
-        res_b2b = self.tampering_barrier.process(image_path)
+    @staticmethod
+    def _safe_run(barrier: VerificationBarrier, image_path: str, reference_path: Optional[str]) -> Dict[str, Any]:
+        """One failing barrier must not crash the others (NFR-06)."""
+        try:
+            return barrier.process(image_path, reference_path)
+        except Exception as e:
+            return {"barrier": barrier.name, "status": "error", "message": str(e)}
 
+    def run_pipeline(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
         return {
-            "watermark_result": res_b1,
-            "deepfake_result": res_b2a,
-            "tampering_result": res_b2b
+            "watermark_result": self._safe_run(self.watermark_barrier, image_path, reference_path),
+            "deepfake_result": self._safe_run(self.deepfake_barrier, image_path, reference_path),
+            "tampering_result": self._safe_run(self.tampering_barrier, image_path, reference_path),
         }
