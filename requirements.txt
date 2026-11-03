@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+numpy
+Pillow
+opencv-python-headless
+scikit-image
+# tests
+pytest
+httpx
