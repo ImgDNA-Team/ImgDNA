@@ -1,0 +1,25 @@
+{
+  "model_version": "efficientnet_b4_celebdf_fullframe_v1",
+  "dataset": "Celeb-DF v2 (full frames, official test list)",
+  "input_size": 380,
+  "thresholds": {
+    "low": 0.798632025718689,
+    "high": 0.9973397850990295
+  },
+  "test_metrics": {
+    "threshold 0.5": {
+      "auc": 0.9734881031064111,
+      "f1": 0.9401408450704225,
+      "precision": 0.9379391100702577,
+      "recall": 0.9423529411764706,
+      "fpr": 0.11910112359550562
+    },
+    "threshold 0.997": {
+      "auc": 0.9734881031064111,
+      "f1": 0.8550531914893617,
+      "precision": 0.9831804281345565,
+      "recall": 0.7564705882352941,
+      "fpr": 0.024719101123595506
+    }
+  }
+}
