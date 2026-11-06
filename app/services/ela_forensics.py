@@ -5,12 +5,15 @@ destroys the JPEG compression grid that ELA depends on. Only the comparison
 step resizes (to align a submitted image with its registered reference).
 """
 import io
+import os
+import re
+import uuid
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from skimage.metrics import structural_similarity
 
-VERSION = "ela-compare-0.2"
+VERSION = "ela-compare-0.3"
 
 
 # ---------------------------------------------------------------- preprocessing
@@ -91,14 +94,25 @@ def ela_analyze(im, quality=90, block=16, z_thresh=3.5, texture_norm=True):
     mask = cv2.resize(blk_mask, (w * block, h * block), interpolation=cv2.INTER_NEAREST)
     mask = np.pad(mask, ((0, H - mask.shape[0]), (0, W - mask.shape[1])))
 
+    # pixel-level z map (blocks upscaled): feeds per-region scores and the heat-map
+    zpix = cv2.resize(z.astype(np.float32), (w * block, h * block), interpolation=cv2.INTER_NEAREST)
+    zpix = np.pad(zpix, ((0, H - zpix.shape[0]), (0, W - zpix.shape[1])), mode="edge")
+
     n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    boxes = [dict(x=int(s[0]), y=int(s[1]), w=int(s[2]), h=int(s[3]), area=int(s[4]))
-             for s in stats[1:] if s[4] >= 4 * block * block]
+    boxes = []
+    for i in range(1, n):
+        x, y, bw, bh, area = (int(v) for v in stats[i])
+        if area < 4 * block * block:
+            continue
+        zr = zpix[y:y + bh, x:x + bw][lab[y:y + bh, x:x + bw] == i]
+        boxes.append(dict(x=x, y=y, w=bw, h=bh, area=area,
+                          score=round(float(np.clip(zr.max() / 12.0, 0, 1)), 3),
+                          mean_z=round(float(zr.mean()), 2)))
     frac = float(mask.mean())
     score = float(np.clip(np.percentile(z, 99.5) / 12.0, 0, 1))
     if not informative:
-        mask = np.zeros_like(mask); boxes = []; frac = 0.0; score = 0.0
-    return dict(informative=informative, ela_vis=vis, ela_gray=gray, mask=mask, boxes=boxes,
+        mask = np.zeros_like(mask); boxes = []; frac = 0.0; score = 0.0; zpix = np.zeros_like(zpix)
+    return dict(informative=informative, ela_vis=vis, ela_gray=gray, mask=mask, boxes=boxes, zmap=zpix,
                 flagged_fraction=frac, score=score, max_z=float(z.max()))
 
 
@@ -169,10 +183,19 @@ def compare_to_reference(sub_im, ref_im, work_side=1024, ssim_thresh=0.6, min_ar
     mask = ((smap < ssim_thresh) & (absdiff > 25)).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.dilate(mask, np.ones((9, 9), np.uint8))
-    n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    boxes = [dict(x=int(s[0]), y=int(s[1]), w=int(s[2]), h=int(s[3]), area=int(s[4]))
-             for s in stats[1:] if s[4] >= min_area]
-    return dict(ssim=float(ssim), hash_similarity=hamming_similarity(sub_im, ref_im),
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    boxes = []
+    for i in range(1, n):
+        x, y, bw, bh, area = (int(v) for v in stats[i])
+        if area < min_area:
+            continue
+        sel = lab[y:y + bh, x:x + bw] == i
+        dissim = 1.0 - smap[y:y + bh, x:x + bw][sel]        # 0 = identical, 1+ = very different
+        boxes.append(dict(x=x, y=y, w=bw, h=bh, area=area,
+                          score=round(float(np.clip(dissim.mean(), 0, 1)), 3)))
+    # soft difference map (0..1) in the reference frame: feeds the heat-map when a reference exists
+    diff_map = cv2.GaussianBlur(np.clip(1.0 - smap, 0, 1).astype(np.float32) * (absdiff > 25), (0, 0), 3)
+    return dict(ssim=float(ssim), hash_similarity=hamming_similarity(sub_im, ref_im), diff_map=diff_map,
                 aligned_with_homography=used_h, mask=mask, boxes=boxes,
                 changed_fraction=float(mask.mean()),
                 aligned_rgb=cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB))
@@ -197,18 +220,125 @@ def _with_normalized(boxes, size):
                  nw=round(b["w"] / W, 4), nh=round(b["h"] / H, 4)) for b in boxes]
 
 
-def analyze(sub_path, ref_path=None):
+# ----------------------------------------------------- tampered-region analysis
+HEAT_Z_MAX = 8.0   # robust z-score that maps to "full red" in the heat-map
+
+
+def _severity(score):
+    return "high" if score >= 0.66 else "medium" if score >= 0.33 else "low"
+
+
+def _iou(a, b):
+    ax2, ay2, bx2, by2 = a["nx"] + a["nw"], a["ny"] + a["nh"], b["nx"] + b["nw"], b["ny"] + b["nh"]
+    iw = max(0.0, min(ax2, bx2) - max(a["nx"], b["nx"]))
+    ih = max(0.0, min(ay2, by2) - max(a["ny"], b["ny"]))
+    inter = iw * ih
+    union = a["nw"] * a["nh"] + b["nw"] * b["nh"] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def build_regions(ela_boxes, ela_size, cmp_boxes, cmp_size, iou_merge=0.3):
+    """Merge ELA and comparison boxes into one ranked list in normalized (0..1) coordinates.
+
+    Overlapping boxes (IoU > iou_merge) are merged into their union and keep the higher score;
+    `sources` says which analyses support the region (more sources = stronger evidence).
+    """
+    items = []
+    for src, boxes, (W, H) in (("ela", ela_boxes, ela_size), ("comparison", cmp_boxes, cmp_size)):
+        for b in boxes:
+            items.append(dict(nx=b["x"] / W, ny=b["y"] / H, nw=b["w"] / W, nh=b["h"] / H,
+                              score=float(b.get("score", 0.0)), sources={src}))
+    merged = []
+    for it in sorted(items, key=lambda r: -r["score"]):
+        for m in merged:
+            if _iou(m, it) > iou_merge:
+                x1, y1 = min(m["nx"], it["nx"]), min(m["ny"], it["ny"])
+                x2 = max(m["nx"] + m["nw"], it["nx"] + it["nw"])
+                y2 = max(m["ny"] + m["nh"], it["ny"] + it["nh"])
+                m.update(nx=x1, ny=y1, nw=x2 - x1, nh=y2 - y1)
+                m["score"] = max(m["score"], it["score"])
+                m["sources"] |= it["sources"]
+                break
+        else:
+            merged.append(it)
+    merged.sort(key=lambda r: -r["score"])
+    return [dict(id=i + 1, sources=sorted(m["sources"]), score=round(m["score"], 3),
+                 severity=_severity(m["score"]), area_fraction=round(m["nw"] * m["nh"], 4),
+                 nx=round(m["nx"], 4), ny=round(m["ny"], 4), nw=round(m["nw"], 4), nh=round(m["nh"], 4))
+            for i, m in enumerate(merged)]
+
+
+def region_summary(regions, grid=256):
+    """Union area of all regions (no double counting) + max score, for the fusion engine."""
+    cov = np.zeros((grid, grid), bool)
+    for r in regions:
+        x1, y1 = int(r["nx"] * grid), int(r["ny"] * grid)
+        x2, y2 = int(np.ceil((r["nx"] + r["nw"]) * grid)), int(np.ceil((r["ny"] + r["nh"]) * grid))
+        cov[y1:y2, x1:x2] = True
+    return dict(region_count=len(regions), flagged_area_fraction=round(float(cov.mean()), 4),
+                max_region_score=round(max((r["score"] for r in regions), default=0.0), 3))
+
+
+# --------------------------------------------------------------- visual outputs
+def render_outputs(im, ela, cmp, regions, output_dir, stem):
+    """Write overlay / ELA map / heat-map PNGs. Returns file names (relative to output_dir)."""
+    os.makedirs(output_dir, exist_ok=True)
+    W, H = im.size
+    arr = np.asarray(im).copy()
+
+    # 1) overlay: red tint on flagged pixels + numbered boxes (rank = region id)
+    mask = (ela["mask"] > 0)
+    if cmp is not None and not cmp.get("reference_mismatch"):
+        mask = mask | (cv2.resize(cmp["mask"], (W, H), interpolation=cv2.INTER_NEAREST) > 0)
+    red = np.zeros_like(arr); red[..., 0] = 255
+    ov = np.where(mask[..., None], (0.6 * arr + 0.4 * red).astype(np.uint8), arr)
+    thick = max(2, round(max(W, H) / 400))
+    for r in regions:
+        x1, y1 = int(r["nx"] * W), int(r["ny"] * H)
+        x2, y2 = int((r["nx"] + r["nw"]) * W), int((r["ny"] + r["nh"]) * H)
+        cv2.rectangle(ov, (x1, y1), (x2, y2), (255, 255, 0), thick)
+        cv2.putText(ov, f"#{r['id']} {r['score']:.2f}", (x1 + 3, max(y1 + 18 * thick, 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45 * thick, (255, 255, 0), thick)
+
+    # 2) heat-map: ELA outlier score combined with reference difference (blue = normal, red = strongly anomalous)
+    zn = np.clip(ela["zmap"] / HEAT_Z_MAX, 0, 1)
+    if cmp is not None and not cmp.get("reference_mismatch"):      # add evidence from the reference comparison
+        zn = np.maximum(zn, cv2.resize(cmp["diff_map"], (W, H), interpolation=cv2.INTER_LINEAR))
+    heat = cv2.cvtColor(cv2.applyColorMap((zn * 255).astype(np.uint8), cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
+    heat = (0.55 * heat + 0.45 * arr).astype(np.uint8)
+
+    files = {}
+    for key, img in (("overlay", ov), ("ela_map", ela["ela_vis"]), ("heatmap", heat)):
+        name = f"{stem}_{key}.png"
+        Image.fromarray(img).save(os.path.join(output_dir, name))
+        files[key] = name
+    return files
+
+
+def _make_stem(src):
+    base = os.path.splitext(os.path.basename(src))[0] if isinstance(src, str) else "image"
+    return re.sub(r"[^A-Za-z0-9_-]", "_", base)[:40] + "_" + uuid.uuid4().hex[:8]
+
+
+def analyze(sub_path, ref_path=None, output_dir=None):
     """Return the tampering (pixel-level) result in the shared JSON contract.
 
-    status: clean | suspicious | tampered | inconclusive
+    status: clean | suspicious | tampered | inconclusive | reference_mismatch
     ELA is only trusted on JPEG input; for PNG etc. the ELA part is
     'inconclusive' and only the comparison with a reference can flag tampering.
+
+    New in 0.3: `evidence.tampered_regions` (merged + ranked, normalized coords, per-region
+    score/severity), top-level `region_count`, `flagged_area_fraction`, `max_region_score`, and,
+    when `output_dir` is given, PNG file names in `evidence.outputs` (relative to output_dir).
     """
+    sub_path = clean_path(sub_path)
     im, fmt = load_image(sub_path)
     is_jpeg = fmt in JPEG_FORMATS
     ela = ela_analyze(im)
     informative = bool(ela["informative"]) and is_jpeg
-    boxes = _with_normalized(ela["boxes"], im.size) if informative else []
+    if not informative:                       # ELA not trustworthy: no ELA regions / map
+        ela = dict(ela, boxes=[], mask=np.zeros_like(ela["mask"]), zmap=np.zeros_like(ela["zmap"]))
+    boxes = _with_normalized(ela["boxes"], im.size)
     score = float(ela["score"]) if informative else 0.0
     ev = dict(ela_score=round(score, 3),
               flagged_fraction=round(ela["flagged_fraction"], 4) if informative else 0.0,
@@ -218,6 +348,7 @@ def analyze(sub_path, ref_path=None):
               note=None if is_jpeg else "ELA is not reliable on non-JPEG inputs; ELA result ignored")
     status = ("suspicious" if (boxes and score >= 0.5)
               else "clean" if informative else "inconclusive")
+    cmp, cmp_boxes, cmp_size = None, [], (1, 1)
     if ref_path:
         ref_im = load_image(ref_path)[0]
         cmp = compare_to_reference(im, ref_im)
@@ -225,6 +356,7 @@ def analyze(sub_path, ref_path=None):
         # Two unrelated images differ everywhere: that is a wrong reference, not tampering.
         mismatch = (cmp["hash_similarity"] < MISMATCH_HASH
                     or (cmp["ssim"] < MISMATCH_SSIM and cmp["changed_fraction"] > MISMATCH_CHANGED))
+        cmp["reference_mismatch"] = bool(mismatch)
         cboxes = [] if mismatch else _with_normalized(cmp["boxes"], ref_c.size)
         ev["comparison"] = dict(ssim=round(cmp["ssim"], 4), hash_similarity=round(cmp["hash_similarity"], 3),
                                 changed_fraction=round(cmp["changed_fraction"], 4), regions=cboxes,
@@ -236,5 +368,16 @@ def analyze(sub_path, ref_path=None):
             ev["note"] = "Submitted image does not match the reference (different image); tampering not assessed."
         elif cboxes:
             status, score = "tampered", max(score, 0.9)
+            cmp_boxes, cmp_size = cboxes, ref_c.size
+        elif status == "inconclusive":
+            # ELA could not judge (e.g. PNG) but the image matches its reference with no differences
+            status = "clean"
+
+    regions = build_regions(ela["boxes"], im.size, cmp_boxes, cmp_size)
+    ev["tampered_regions"] = regions
+    ev["outputs"] = None
+    if output_dir:
+        # file names only (relative to output_dir): do not leak server paths through the API
+        ev["outputs"] = render_outputs(im, ela, cmp, regions, output_dir, _make_stem(sub_path))
     return dict(barrier="tampering", status=status, score=round(float(score), 3),
-                ela_score=ev["ela_score"], evidence=ev, version=VERSION)
+                ela_score=ev["ela_score"], **region_summary(regions), evidence=ev, version=VERSION)

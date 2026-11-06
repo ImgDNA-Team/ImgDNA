@@ -51,8 +51,13 @@ def test_png_ela_is_inconclusive(imgs):
     assert r["status"] == "inconclusive" and r["evidence"]["ela_informative"] is False
 
 
-def test_png_still_compared_to_reference(imgs):
-    assert analyze(imgs["png"], imgs["ref"])["status"] == "inconclusive"  # unchanged -> nothing flagged
+def test_png_matching_its_reference_is_clean(imgs):
+    # ELA cannot judge a PNG, but the comparison shows it is identical to the reference
+    assert analyze(imgs["png"], imgs["ref"])["status"] == "clean"
+
+
+def test_png_without_reference_stays_inconclusive(imgs):
+    assert analyze(imgs["png"])["status"] == "inconclusive"
 
 
 def test_corrupt_raises(imgs):

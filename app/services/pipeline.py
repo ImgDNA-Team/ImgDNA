@@ -30,8 +30,10 @@ class TamperingBarrier(VerificationBarrier):
     """Pixel-level barrier (Person 3): preprocessing + ELA + comparison with the registered original."""
     name = "tampering"
 
-    def process(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
-        return tampering_analyze(image_path, reference_path)
+    def process(self, image_path: str, reference_path: Optional[str] = None,
+                output_dir: Optional[str] = None) -> Dict[str, Any]:
+        # output_dir (optional): where to write the overlay / ELA map / heat-map PNGs
+        return tampering_analyze(image_path, reference_path, output_dir=output_dir)
 
 
 class VerificationPipeline:
@@ -41,16 +43,19 @@ class VerificationPipeline:
         self.tampering_barrier = TamperingBarrier()
 
     @staticmethod
-    def _safe_run(barrier: VerificationBarrier, image_path: str, reference_path: Optional[str]) -> Dict[str, Any]:
+    def _safe_run(barrier: VerificationBarrier, image_path: str, reference_path: Optional[str],
+                  **kwargs) -> Dict[str, Any]:
         """One failing barrier must not crash the others (NFR-06)."""
         try:
-            return barrier.process(image_path, reference_path)
+            return barrier.process(image_path, reference_path, **kwargs)
         except Exception as e:
             return {"barrier": barrier.name, "status": "error", "message": str(e)}
 
-    def run_pipeline(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
+    def run_pipeline(self, image_path: str, reference_path: Optional[str] = None,
+                     output_dir: Optional[str] = None) -> Dict[str, Any]:
         return {
             "watermark_result": self._safe_run(self.watermark_barrier, image_path, reference_path),
             "deepfake_result": self._safe_run(self.deepfake_barrier, image_path, reference_path),
-            "tampering_result": self._safe_run(self.tampering_barrier, image_path, reference_path),
+            "tampering_result": self._safe_run(self.tampering_barrier, image_path, reference_path,
+                                                  output_dir=output_dir),
         }
