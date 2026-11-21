@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 
 from app.services.ela_forensics import analyze as tampering_analyze
-
+from app.services.verdict_fusion import VerdictFusionEngine
 
 class VerificationBarrier(ABC):
     name = "barrier"
@@ -59,3 +59,38 @@ class VerificationPipeline:
             "tampering_result": self._safe_run(self.tampering_barrier, image_path, reference_path,
                                                   output_dir=output_dir),
         }
+
+    def run_with_verdict(
+        self,
+        image_path: str,
+        reference_path: Optional[str] = None,
+        output_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+
+        # Run all verification barriers
+        results = self.run_pipeline(
+            image_path,
+            reference_path,
+            output_dir
+        )
+
+        # Fuse the results into one final verdict
+        fusion_engine = VerdictFusionEngine()
+
+        fusion_result = fusion_engine.fuse(
+            watermark_result=results["watermark_result"],
+            deepfake_result=results["deepfake_result"],
+            tampering_result=results["tampering_result"],
+            watermark_is_real=False,
+            deepfake_is_real=False,
+        )
+
+        return {
+            "status": "success",
+            "results": results,
+            "verdict": fusion_result["verdict"],
+            "confidence_score": fusion_result["confidence_score"],
+            "reasons": fusion_result["reasons"],
+            "message": fusion_result["message"],
+        }
+    

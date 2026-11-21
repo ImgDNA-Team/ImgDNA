@@ -17,10 +17,15 @@ def read_root():
     return {"message": "Welcome to Image DNA Verification Pipeline - Developed by shahd_elhewehi"}
 
 @app.post("/api/v1/verify")
-def verify_image(image_path: str, reference_path: Optional[str] = None, save_outputs: bool = False):
-    results = pipeline.run_pipeline(image_path, reference_path,
-                                    output_dir=OUTPUT_DIR if save_outputs else None)
-    return {
-        "status": "success",
-        "results": results
-    }
+def verify_image(
+    image_path: str,
+    reference_path: Optional[str] = None,
+    save_outputs: bool = False
+):
+    result = pipeline.run_with_verdict(
+        image_path=image_path,
+        reference_path=reference_path,
+        output_dir=OUTPUT_DIR if save_outputs else None
+    )
+
+    return result
