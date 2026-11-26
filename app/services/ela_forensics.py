@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from skimage.metrics import structural_similarity
 
-VERSION = "ela-compare-0.3"
+VERSION = "ela-compare-0.4"
 
 
 # ---------------------------------------------------------------- preprocessing
@@ -242,6 +242,7 @@ def build_regions(ela_boxes, ela_size, cmp_boxes, cmp_size, iou_merge=0.3):
 
     Overlapping boxes (IoU > iou_merge) are merged into their union and keep the higher score;
     `sources` says which analyses support the region (more sources = stronger evidence).
+    Ranking: comparison-backed regions first, then by score.
     """
     items = []
     for src, boxes, (W, H) in (("ela", ela_boxes, ela_size), ("comparison", cmp_boxes, cmp_size)):
@@ -261,7 +262,9 @@ def build_regions(ela_boxes, ela_size, cmp_boxes, cmp_size, iou_merge=0.3):
                 break
         else:
             merged.append(it)
-    merged.sort(key=lambda r: -r["score"])
+    # Regions backed by the reference comparison are far stronger evidence than ELA-only outliers
+    # (ELA alone raised false alarms on ~1/3 of unmodified images), so they rank first.
+    merged.sort(key=lambda r: (-("comparison" in r["sources"]), -r["score"]))
     return [dict(id=i + 1, sources=sorted(m["sources"]), score=round(m["score"], 3),
                  severity=_severity(m["score"]), area_fraction=round(m["nw"] * m["nh"], 4),
                  nx=round(m["nx"], 4), ny=round(m["ny"], 4), nw=round(m["nw"], 4), nh=round(m["nh"], 4))
@@ -326,6 +329,8 @@ def analyze(sub_path, ref_path=None, output_dir=None):
     status: clean | suspicious | tampered | inconclusive | reference_mismatch
     ELA is only trusted on JPEG input; for PNG etc. the ELA part is
     'inconclusive' and only the comparison with a reference can flag tampering.
+    With a reference, the comparison decides: differences -> tampered, no differences -> clean
+    (ELA outliers alone never override a matching reference).
 
     New in 0.3: `evidence.tampered_regions` (merged + ranked, normalized coords, per-region
     score/severity), top-level `region_count`, `flagged_area_fraction`, `max_region_score`, and,
@@ -369,9 +374,13 @@ def analyze(sub_path, ref_path=None, output_dir=None):
         elif cboxes:
             status, score = "tampered", max(score, 0.9)
             cmp_boxes, cmp_size = cboxes, ref_c.size
-        elif status == "inconclusive":
-            # ELA could not judge (e.g. PNG) but the image matches its reference with no differences
-            status = "clean"
+        else:
+            # The registered original shows no difference. That beats ELA: on unmodified images ELA alone
+            # raised a false "suspicious" in about a third of cases, so its outliers are ignored here.
+            if status == "suspicious":
+                ev["note"] = "ELA found weak outliers, but the image matches its registered original; they were ignored."
+            status, score = "clean", 0.0
+            ela = dict(ela, boxes=[], mask=np.zeros_like(ela["mask"]), zmap=np.zeros_like(ela["zmap"]))
 
     regions = build_regions(ela["boxes"], im.size, cmp_boxes, cmp_size)
     ev["tampered_regions"] = regions
