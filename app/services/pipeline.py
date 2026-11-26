@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional
 
 from app.services.ela_forensics import analyze as tampering_analyze
 from app.services.verdict_fusion import VerdictFusionEngine
+from app.services.tampering_report import summarize_tampering, describe_regions
 
 class VerificationBarrier(ABC):
     name = "barrier"
@@ -85,12 +86,19 @@ class VerificationPipeline:
             deepfake_is_real=False,
         )
 
+        # Point the user at WHERE the tampering evidence is (Person 3)
+        reasons = list(fusion_result["reasons"])
+        region_reason = describe_regions(results["tampering_result"])
+        if region_reason:
+            reasons.append(region_reason)
+
         return {
             "status": "success",
             "results": results,
             "verdict": fusion_result["verdict"],
             "confidence_score": fusion_result["confidence_score"],
-            "reasons": fusion_result["reasons"],
+            "reasons": reasons,
             "message": fusion_result["message"],
+            "tampering_analysis": summarize_tampering(results["tampering_result"]),
         }
     
