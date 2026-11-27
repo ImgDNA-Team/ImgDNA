@@ -5,6 +5,9 @@ from app.services.ela_forensics import analyze as tampering_analyze
 from app.services.verdict_fusion import VerdictFusionEngine
 from app.services.tampering_report import summarize_tampering, describe_regions
 
+from pathlib import Path
+# from AI_Detector.ai_detector import DeepfakeDetector
+
 class VerificationBarrier(ABC):
     name = "barrier"
 
@@ -19,13 +22,36 @@ class WatermarkBarrier(VerificationBarrier):
     def process(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
         return {"barrier": "watermark", "status": "intact", "payload_matched": True}
 
-
 class DeepfakeBarrier(VerificationBarrier):
     name = "deepfake"
 
-    def process(self, image_path: str, reference_path: Optional[str] = None) -> Dict[str, Any]:
-        return {"barrier": "deepfake", "manipulation_score": 0.05}
+    _detector = None
 
+    def _get_detector(self):
+        if DeepfakeBarrier._detector is None:
+            from AI_Detector.ai_detector import DeepfakeDetector
+
+            root = Path(__file__).resolve().parents[2]
+            model_dir = root / "AI_Detector"
+
+            DeepfakeBarrier._detector = DeepfakeDetector(
+                model_dir / "best.pth",
+                model_dir / "thresholds.json"
+            )
+
+        return DeepfakeBarrier._detector
+
+    def process(self, image_path: str,
+                reference_path: Optional[str] = None) -> Dict[str, Any]:
+
+        detector = self._get_detector()
+
+        result = detector.predict(
+            image_path,
+            with_heatmap=True
+        )
+
+        return result
 
 class TamperingBarrier(VerificationBarrier):
     """Pixel-level barrier (Person 3): preprocessing + ELA + comparison with the registered original."""
@@ -83,7 +109,7 @@ class VerificationPipeline:
             deepfake_result=results["deepfake_result"],
             tampering_result=results["tampering_result"],
             watermark_is_real=False,
-            deepfake_is_real=False,
+            deepfake_is_real=True,
         )
 
         # Point the user at WHERE the tampering evidence is (Person 3)

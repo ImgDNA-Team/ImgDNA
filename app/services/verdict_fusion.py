@@ -26,6 +26,8 @@ class VerdictFusionEngine:
         reasons = []
 
         tampering_status = str(tampering_result.get("status", "")).lower()
+        deepfake_label = str(deepfake_result.get("label", "")).lower()
+        deepfake_error = deepfake_result.get("error")
 
         if tampering_status == "tampered":
             verdict = Verdict.TAMPERED
@@ -33,12 +35,11 @@ class VerdictFusionEngine:
                 "Tampering detector identified strong evidence of manipulation."
             )
 
-        elif (
-            deepfake_is_real
-            and str(deepfake_result.get("label", "")).lower() == "fake"
-        ):
+        elif deepfake_is_real and deepfake_label == "fake":
             verdict = Verdict.AI_GENERATED
-            reasons.append("AI detector classified the image as fake.")
+            reasons.append(
+                "AI detector classified the image as fake."
+            )
 
         else:
             verdict = Verdict.INCONCLUSIVE
@@ -49,19 +50,33 @@ class VerdictFusionEngine:
                 )
 
             elif tampering_status == "suspicious":
-                reasons.append("Tampering detector found suspicious regions.")
+                reasons.append(
+                    "Tampering detector found suspicious regions."
+                )
 
             elif tampering_status == "error":
-                reasons.append("Tampering detector failed.")
+                reasons.append(
+                    "Tampering detector failed."
+                )
 
-            if not deepfake_is_real:
+            if deepfake_error:
+                reasons.append(
+                    "AI detector failed: " + str(deepfake_error)
+                )
+
+            elif not deepfake_is_real:
                 reasons.append(
                     "AI detector is not yet verified as a real detector."
                 )
 
-            elif str(deepfake_result.get("label", "")).lower() == "suspicious":
+            elif deepfake_label == "suspicious":
                 reasons.append(
                     "AI detector found suspicious AI-related patterns."
+                )
+
+            elif deepfake_label == "real":
+                reasons.append(
+                    "AI detector found no manipulation evidence."
                 )
 
             if not watermark_is_real:
