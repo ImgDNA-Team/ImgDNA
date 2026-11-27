@@ -54,18 +54,17 @@ AI_Detector/
 ├── best.pth                  model weights (about 71 MB, below GitHub's 100 MB file limit)
 ├── thresholds.json           low / high thresholds
 ├── model_meta.json           model version, dataset, test metrics
-├── training_history.csv      per-epoch training and validation metrics
-├── test_predictions.csv      per-image test scores
-├── AI_Detector.ipynb         training, evaluation and export notebook
-└── test.jpg, test.png        sample images for the smoke test
+├── results/                  training_history.csv, test_predictions.csv
+├── images/                   test.jpg, test.png (sample images for the smoke test)
+└── Notebook/AI_Detector.ipynb   training, evaluation and export notebook
 ```
 
 ## Usage
 
 ```bash
 pip install -r requirements.txt
-python test.py test.jpg                        # smoke test
-python ai_detector.py test.jpg --heatmap heatmap.png
+python test.py images/test.jpg                        # smoke test
+python ai_detector.py images/test.jpg --heatmap heatmap.png
 ```
 
 ```python
