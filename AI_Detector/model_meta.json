@@ -6,6 +6,7 @@
     "low": 0.798632025718689,
     "high": 0.9973397850990295
   },
+  "score_note": "uncalibrated manipulation score (sigmoid of the logit), not a probability; use the label for decisions",
   "test_metrics": {
     "threshold 0.5": {
       "auc": 0.9734881031064111,

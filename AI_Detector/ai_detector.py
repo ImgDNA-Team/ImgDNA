@@ -8,6 +8,13 @@ Usage:
 
 Command line:
     python ai_detector.py photo.jpg --weights best.pth --thresholds thresholds.json
+
+Notes:
+    * `score` (0..1) is an UNCALIBRATED manipulation score, not a probability.
+      Decisions should use `label`, which is derived from validated thresholds.
+    * `label == "real"` means no manipulation evidence was found. It does not
+      prove the image is authentic.
+    * The Grad-CAM heat-map is only returned when `label != "real"`.
 """
 
 import argparse
@@ -21,11 +28,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 from torchvision.models import efficientnet_b4
 
-__all__ = ["DeepfakeDetector", "MODEL_VERSION"]
+__all__ = ["DeepfakeDetector", "MODEL_VERSION", "load_image"]
 
 MODEL_VERSION = "efficientnet_b4_celebdf_fullframe_v1"
 IMAGE_SIZE = 380
@@ -35,15 +42,31 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 ImageInput = Union[str, Path, bytes, Image.Image]
 
 
+def load_image(image: ImageInput) -> Image.Image:
+    """Open an image, apply its EXIF orientation, and convert it to RGB."""
+    if isinstance(image, Image.Image):
+        pil = image
+    elif isinstance(image, (bytes, bytearray)):
+        pil = Image.open(io.BytesIO(image))
+    else:
+        pil = Image.open(image)
+
+    try:
+        pil = ImageOps.exif_transpose(pil)
+    except Exception:
+        pass  # unreadable EXIF must not reject an otherwise valid image
+    return pil.convert("RGB")
+
+
 def build_model() -> nn.Module:
-    """EfficientNet-B4 with one output logit: P(fake) = sigmoid(logit)."""
+    """EfficientNet-B4 with one output logit; sigmoid(logit) is the uncalibrated fake score."""
     model = efficientnet_b4(weights=None)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, 1)
     return model
 
 
 def build_transform(image_size: int = IMAGE_SIZE) -> transforms.Compose:
-    """Evaluation transform: the whole image is kept (no face crop)."""
+    """Evaluation transform: the whole image is kept (no face crop, aspect ratio not preserved)."""
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
@@ -115,25 +138,20 @@ class DeepfakeDetector:
         if self.low > self.high:
             raise ValueError("`low` threshold must not be greater than `high`.")
 
-    @staticmethod
-    def _load(image: ImageInput) -> Image.Image:
-        if isinstance(image, Image.Image):
-            return image.convert("RGB")
-        if isinstance(image, (bytes, bytearray)):
-            return Image.open(io.BytesIO(image)).convert("RGB")
-        return Image.open(image).convert("RGB")
-
     def _label(self, score: float) -> str:
         if score >= self.high:
             return "fake"
         return "suspicious" if score >= self.low else "real"
 
-    def explain(self, image: ImageInput) -> Image.Image:
-        """Grad-CAM overlay on the resized input image."""
-        resized = self._load(image).resize((self.image_size, self.image_size))
+    def _explain_pil(self, image: Image.Image) -> Image.Image:
+        resized = image.resize((self.image_size, self.image_size))
         tensor = self.transform(resized).unsqueeze(0).to(self.device)
         cam = grad_cam(self.model, tensor, self.model.features[-1])
         return overlay_heatmap(resized, cam)
+
+    def explain(self, image: ImageInput) -> Image.Image:
+        """Grad-CAM overlay on the resized input image (meaningful for non-real images)."""
+        return self._explain_pil(load_image(image))
 
     def predict(self, image: ImageInput, with_heatmap: bool = False) -> dict:
         """Return the barrier result. Failures are reported in `error`, never raised."""
@@ -147,13 +165,13 @@ class DeepfakeDetector:
             "error": None,
         }
         try:
-            pil_image = self._load(image)
+            pil_image = load_image(image)
             tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 score = torch.sigmoid(self.model(tensor)).item()
             result["score"], result["label"] = score, self._label(score)
-            if with_heatmap:
-                result["heatmap_png_base64"] = encode_png_base64(self.explain(pil_image))
+            if with_heatmap and result["label"] != "real":
+                result["heatmap_png_base64"] = encode_png_base64(self._explain_pil(pil_image))
         except Exception as exc:
             result["error"] = f"{type(exc).__name__}: {exc}"
         return result
@@ -168,11 +186,16 @@ def _main() -> None:
     args = parser.parse_args()
 
     detector = DeepfakeDetector(args.weights, args.thresholds)
-    result = detector.predict(args.image)
+    result = detector.predict(args.image, with_heatmap=bool(args.heatmap))
+    heatmap = result.pop("heatmap_png_base64")
     print(json.dumps(result, indent=2))
-    if args.heatmap and result["error"] is None:
-        detector.explain(args.image).save(args.heatmap)
-        print("Heat-map saved to", args.heatmap)
+
+    if args.heatmap:
+        if heatmap:
+            Path(args.heatmap).write_bytes(base64.b64decode(heatmap))
+            print("Heat-map saved to", args.heatmap)
+        else:
+            print("No heat-map: the image is labelled 'real' or an error occurred.")
 
 
 if __name__ == "__main__":
